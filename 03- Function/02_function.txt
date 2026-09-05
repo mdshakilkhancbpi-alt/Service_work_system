@@ -1,0 +1,28 @@
+SET DEFINE OFF;
+
+CREATE OR REPLACE FUNCTION XH_APEX_ERROR_HANDLER (
+    p_error IN apex_error.t_error
+) RETURN apex_error.t_error_result
+IS
+    l_result apex_error.t_error_result;
+BEGIN
+    l_result := apex_error.init_error_result(
+        p_error => p_error
+    );
+
+    -- CUSTOM RAISE_APPLICATION_ERROR (-20000 to -20099) হ্যান্ডেল করা
+    IF p_error.ora_sqlcode BETWEEN -20099 AND -20000 THEN
+        l_result.message := REGEXP_SUBSTR(
+            p_error.ora_sqlerrm,
+            'ORA-[0-9]+:\s*(.*)',
+            1,
+            1,
+            NULL,
+            1
+        );
+        l_result.additional_info := NULL;
+    END IF;
+
+    RETURN l_result;
+END XH_APEX_ERROR_HANDLER;
+/
