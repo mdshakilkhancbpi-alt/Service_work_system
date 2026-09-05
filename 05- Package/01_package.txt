@@ -1,0 +1,319 @@
+SET DEFINE OFF;
+
+--------------------------------------------------------
+-- PACKAGE SPECIFICATION
+--------------------------------------------------------
+CREATE OR REPLACE PACKAGE PKG_XH_ENGINEER AS
+
+    PROCEDURE UPDATE_STATUS(
+        p_work_order_id IN NUMBER,
+        p_new_status    IN VARCHAR2,
+        p_user_name     IN VARCHAR2
+    );
+
+    PROCEDURE COMPLETE_WORK_ORDER(
+        p_work_order_id IN NUMBER,
+        p_user_name     IN VARCHAR2,
+        p_message       OUT VARCHAR2
+    );
+
+    PROCEDURE START_WORK_ORDER(
+        p_work_order_id IN NUMBER,
+        p_user_name     IN VARCHAR2
+    );
+
+END PKG_XH_ENGINEER;
+/
+
+--------------------------------------------------------
+-- PACKAGE BODY
+--------------------------------------------------------
+CREATE OR REPLACE PACKAGE BODY PKG_XH_ENGINEER AS
+
+    ----------------------------------------------------
+    -- 1. UPDATE_STATUS
+    ----------------------------------------------------
+    PROCEDURE UPDATE_STATUS(
+        p_work_order_id IN NUMBER,
+        p_new_status    IN VARCHAR2,
+        p_user_name     IN VARCHAR2
+    ) IS
+        v_current_status   VARCHAR2(20);
+        v_engineer_id      NUMBER(10,0) := 0;
+        v_login_user_id    NUMBER(10,0) := 0;
+    BEGIN
+        -- Find logged-in engineer
+        SELECT ID
+        INTO v_login_user_id
+        FROM XH_USERS
+        WHERE UPPER(USER_NAME) = UPPER(p_user_name)
+          AND STATUS = 'Y'
+          AND ROLE = 'ENGINEER';
+
+        -- Lock work order
+        SELECT STATUS, XH_ASSIGNED_ENGINEER_ID
+        INTO v_current_status, v_engineer_id
+        FROM XH_WORK_ORDERS
+        WHERE ID = p_work_order_id
+        FOR UPDATE;
+
+        -- Validate engineer assignment
+        IF v_engineer_id IS NULL THEN
+            RAISE_APPLICATION_ERROR(
+                -20040,
+                'No engineer is assigned to this Work Order.'
+            );
+        END IF;
+
+        -- Validate assigned engineer matches logged-in user
+        IF v_engineer_id <> v_login_user_id THEN
+            RAISE_APPLICATION_ERROR(
+                -20041,
+                'Only assigned engineer can modify this Work Order.'
+            );
+        END IF;
+
+        -- Validate status transitions
+        IF v_current_status = 'IN PROGRESS' AND p_new_status = 'ON HOLD' THEN
+            NULL;
+        ELSIF v_current_status = 'ON HOLD' AND p_new_status = 'IN PROGRESS' THEN
+            NULL;
+        ELSE
+            RAISE_APPLICATION_ERROR(
+                -20042,
+                'Invalid status transition from ' || v_current_status || ' to ' || p_new_status || '.'
+            );
+        END IF;
+
+        -- Update status
+        UPDATE XH_WORK_ORDERS
+        SET STATUS        = p_new_status,
+            MODIFIED_BY   = p_user_name,
+            MODIFIED_DATE = LOCALTIMESTAMP
+        WHERE ID = p_work_order_id;
+
+    EXCEPTION
+        WHEN NO_DATA_FOUND THEN
+            RAISE_APPLICATION_ERROR(
+                -20043,
+                'Work Order or active engineer account was not found.'
+            );
+    END UPDATE_STATUS;
+
+
+    ----------------------------------------------------
+    -- 2. COMPLETE_WORK_ORDER
+    ----------------------------------------------------
+    PROCEDURE COMPLETE_WORK_ORDER(
+        p_work_order_id IN NUMBER,
+        p_user_name     IN VARCHAR2,
+        p_message       OUT VARCHAR2
+    ) IS
+        v_status            VARCHAR2(20);
+        v_engineer_id       NUMBER(10,0) := 0;
+        v_approval_status   VARCHAR2(20);
+        v_total_cost        NUMBER(12,2) := 0;
+        v_threshold         NUMBER(12,2);
+        v_stock_quantity    NUMBER(8,0);
+        v_new_quantity      NUMBER(8,0);
+    BEGIN
+        -- Lock Work Order
+        SELECT STATUS, XH_ASSIGNED_ENGINEER_ID, NVL(APPROVAL_STATUS, 'NOT_REQUIRED')
+        INTO v_status, v_engineer_id, v_approval_status
+        FROM XH_WORK_ORDERS
+        WHERE ID = p_work_order_id
+        FOR UPDATE;
+
+        -- Validate Status
+        IF v_status <> 'IN PROGRESS' THEN
+            RAISE_APPLICATION_ERROR(
+                -20041,
+                'Only IN PROGRESS Work Orders can be completed.'
+            );
+        END IF;
+
+        -- Validate Assigned Engineer
+        IF v_engineer_id IS NULL THEN
+            RAISE_APPLICATION_ERROR(
+                -20042,
+                'No engineer is assigned to this Work Order.'
+            );
+        END IF;
+
+        -- Calculate Total Parts Cost
+        SELECT NVL(SUM(QUANTITY_USED * UNIT_COST), 0)
+        INTO v_total_cost
+        FROM XH_WORK_ORDER_PARTS
+        WHERE XH_WORK_ORDER_ID = p_work_order_id;
+
+        -- Effective Approval Threshold Check
+        BEGIN
+            SELECT THRESHOLD_VAL
+            INTO v_threshold
+            FROM (
+                SELECT THRESHOLD_VAL
+                FROM XH_CONFIG_THRESHOLDS
+                WHERE CONFIG_KEY = 'PARTS_APPROVAL_THRESHOLD'
+                  AND EFFECTIVE_FROM_DATE <= SYSDATE
+                  AND (EFFECTIVE_TO_DATE IS NULL OR EFFECTIVE_TO_DATE >= SYSDATE)
+                ORDER BY EFFECTIVE_FROM_DATE DESC
+            )
+            WHERE ROWNUM = 1;
+        EXCEPTION
+            WHEN NO_DATA_FOUND THEN
+                RAISE_APPLICATION_ERROR(
+                    -20043,
+                    'No effective parts approval threshold is configured.'
+                );
+        END;
+
+        -- Check Manager Approval Requirement
+        IF v_total_cost > v_threshold AND v_approval_status <> 'APPROVED' THEN
+            UPDATE XH_WORK_ORDERS
+            SET TOTAL_PARTS_COST = v_total_cost,
+                APPROVAL_STATUS  = 'PENDING',
+                STATUS           = 'IN PROGRESS',
+                MODIFIED_BY      = p_user_name,
+                MODIFIED_DATE    = LOCALTIMESTAMP
+            WHERE ID = p_work_order_id;
+
+            p_message := 'Manager approval required. Parts cost (' ||
+                         TO_CHAR(v_total_cost, 'FM9999999990.00') ||
+                         ') exceeds the approval threshold (' ||
+                         TO_CHAR(v_threshold, 'FM9999999990.00') || ').';
+            RETURN;
+        END IF;
+
+        -- Process Van Stock Deduction
+        FOR r IN (
+            SELECT XH_PART_ID, QUANTITY_USED
+            FROM XH_WORK_ORDER_PARTS
+            WHERE XH_WORK_ORDER_ID = p_work_order_id
+        ) LOOP
+            -- Lock stock row
+            SELECT QUANTITY
+            INTO v_stock_quantity
+            FROM XH_VAN_STOCKS
+            WHERE XH_USER_ID = v_engineer_id
+              AND XH_PART_ID = r.XH_PART_ID
+            FOR UPDATE;
+
+            -- Stock availability check
+            IF v_stock_quantity < r.QUANTITY_USED THEN
+                RAISE_APPLICATION_ERROR(
+                    -20045,
+                    'Insufficient stock for Part ID ' || r.XH_PART_ID ||
+                    '. Available: ' || v_stock_quantity ||
+                    ', Required: ' || r.QUANTITY_USED
+                );
+            END IF;
+
+            v_new_quantity := v_stock_quantity - r.QUANTITY_USED;
+
+            -- Deduct stock
+            UPDATE XH_VAN_STOCKS
+            SET QUANTITY      = v_new_quantity,
+                MODIFIED_BY   = p_user_name,
+                MODIFIED_DATE = LOCALTIMESTAMP
+            WHERE XH_USER_ID = v_engineer_id
+              AND XH_PART_ID = r.XH_PART_ID;
+
+            -- Audit stock movement
+            INSERT INTO XH_STOCK_MOVEMENT_AUDITS (
+                XH_ENGINEER_ID, XH_PART_ID, QUANTITY_CHANGE, TYPE, 
+                XH_WORK_ORDER_ID, QUANTITY_BEFORE, QUANTITY_AFTER, 
+                CREATED_BY, CREATED_DATE
+            ) VALUES (
+                v_engineer_id, r.XH_PART_ID, -r.QUANTITY_USED, 'CONSUMED', 
+                p_work_order_id, v_stock_quantity, v_new_quantity, 
+                p_user_name, LOCALTIMESTAMP
+            );
+        END LOOP;
+
+        -- Complete Work Order
+        UPDATE XH_WORK_ORDERS
+        SET TOTAL_PARTS_COST    = v_total_cost,
+            STATUS              = 'COMPLETED',
+            ACTUAL_RESOLVE_TIME = SYSDATE,
+            MODIFIED_BY         = p_user_name,
+            MODIFIED_DATE       = LOCALTIMESTAMP
+        WHERE ID = p_work_order_id;
+
+        p_message := 'Work Order completed successfully.';
+
+    EXCEPTION
+        WHEN NO_DATA_FOUND THEN
+            RAISE_APPLICATION_ERROR(
+                -20046,
+                'Work Order or required engineer stock was not found.'
+            );
+    END COMPLETE_WORK_ORDER;
+
+
+    ----------------------------------------------------
+    -- 3. START_WORK_ORDER
+    ----------------------------------------------------
+    PROCEDURE START_WORK_ORDER(
+        p_work_order_id IN NUMBER,
+        p_user_name     IN VARCHAR2
+    ) IS
+        v_status        XH_WORK_ORDERS.STATUS%TYPE;
+        v_engineer_id   XH_WORK_ORDERS.XH_ASSIGNED_ENGINEER_ID%TYPE;
+        v_login_user_id XH_USERS.ID%TYPE;
+    BEGIN
+        -- Find logged-in user
+        SELECT ID
+        INTO v_login_user_id
+        FROM XH_USERS
+        WHERE UPPER(USER_NAME) = UPPER(p_user_name)
+          AND STATUS = 'Y'
+          AND ROLE = 'ENGINEER';
+
+        -- Lock Work Order
+        SELECT STATUS, XH_ASSIGNED_ENGINEER_ID
+        INTO v_status, v_engineer_id
+        FROM XH_WORK_ORDERS
+        WHERE ID = p_work_order_id
+        FOR UPDATE;
+
+        -- Validate assignment
+        IF v_engineer_id IS NULL THEN
+            RAISE_APPLICATION_ERROR(
+                -20050,
+                'No engineer is assigned to this Work Order.'
+            );
+        END IF;
+
+        -- Check user authority
+        IF v_engineer_id <> v_login_user_id THEN
+            RAISE_APPLICATION_ERROR(
+                -20051,
+                'You are not the assigned engineer for this Work Order.'
+            );
+        END IF;
+
+        -- Validate Status
+        IF v_status <> 'ASSIGNED' THEN
+            RAISE_APPLICATION_ERROR(
+                -20052,
+                'Only ASSIGNED Work Orders can be started.'
+            );
+        END IF;
+
+        -- Start Work Order
+        UPDATE XH_WORK_ORDERS
+        SET STATUS        = 'IN PROGRESS',
+            MODIFIED_BY   = p_user_name,
+            MODIFIED_DATE = LOCALTIMESTAMP
+        WHERE ID = p_work_order_id;
+
+    EXCEPTION
+        WHEN NO_DATA_FOUND THEN
+            RAISE_APPLICATION_ERROR(
+                -20053,
+                'Work Order or active engineer account was not found.'
+            );
+    END START_WORK_ORDER;
+
+END PKG_XH_ENGINEER;
+/
