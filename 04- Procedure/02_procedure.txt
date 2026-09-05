@@ -1,0 +1,60 @@
+SET DEFINE OFF;
+
+CREATE OR REPLACE PROCEDURE XH_APPROVE_WORK_ORDER(
+    p_work_order_id IN NUMBER,
+    p_manager_name  IN VARCHAR2
+) IS
+    v_status            VARCHAR2(20);
+    v_approval_status   VARCHAR2(20);
+    v_total_cost        NUMBER;
+    v_threshold         NUMBER;
+BEGIN
+    ---------- Lock the Work Order ----------
+    SELECT STATUS, APPROVAL_STATUS, NVL(TOTAL_PARTS_COST, 0)
+    INTO v_status, v_approval_status, v_total_cost
+    FROM XH_WORK_ORDERS
+    WHERE ID = p_work_order_id
+    FOR UPDATE;
+
+    ---------- Validate Approval Status ----------
+    IF v_approval_status <> 'PENDING' THEN
+        RAISE_APPLICATION_ERROR(
+            -20021,
+            'This Work Order is not awaiting manager approval.'
+        );
+    END IF;
+
+    ---------- Validate Work Order Status ----------
+    IF v_status <> 'IN PROGRESS' THEN
+        RAISE_APPLICATION_ERROR(
+            -20022,
+            'Only IN PROGRESS Work Orders can be approved.'
+        );
+    END IF;
+
+    ---------- Get Current Effective Threshold ----------
+    SELECT THRESHOLD_VAL
+    INTO v_threshold
+    FROM XH_CONFIG_THRESHOLDS
+    WHERE CONFIG_KEY = 'PARTS_APPROVAL_THRESHOLD'
+      AND EFFECTIVE_FROM_DATE <= SYSDATE
+      AND (EFFECTIVE_TO_DATE IS NULL OR SYSDATE <= EFFECTIVE_TO_DATE);
+
+    ---------- Save Approval Snapshot ----------
+    UPDATE XH_WORK_ORDERS
+    SET APPROVAL_STATUS    = 'APPROVED',
+        APPROVED_BY        = p_manager_name,
+        APPROVED_THRESHOLD = v_threshold,
+        APPROVAL_TIME      = SYSDATE 
+    WHERE ID = p_work_order_id;
+
+    COMMIT;
+
+EXCEPTION
+    WHEN NO_DATA_FOUND THEN
+        RAISE_APPLICATION_ERROR(
+            -20023,
+            'Work Order or effective approval threshold not found.'
+        );
+END XH_APPROVE_WORK_ORDER;
+/
