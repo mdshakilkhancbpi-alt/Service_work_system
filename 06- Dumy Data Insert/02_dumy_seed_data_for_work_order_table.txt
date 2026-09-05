@@ -1,0 +1,25 @@
+BEGIN
+    FOR i IN 1..250000 LOOP
+
+        INSERT INTO XH_WORK_ORDERS (
+           
+            PARTNER_REF_ID,
+            XH_CUSTOMER_ID,
+            XH_PRIORITY_ID,
+            STATUS,
+            APPROVAL_STATUS
+        )
+        VALUES (
+            
+            'WO-DUMMY-' || LPAD(i, 6, '0'),
+            MOD(i - 1, 2) + 1,
+            MOD(i - 1, 3) + 1,
+            'NEW',
+            'NOT_REQUIRED'
+        );
+
+    END LOOP;
+
+    COMMIT;
+END;
+/
