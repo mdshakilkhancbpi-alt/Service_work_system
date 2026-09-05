@@ -1,0 +1,71 @@
+create or replace PROCEDURE XH_ADD_PART_TO_WORK_ORDER(
+        p_work_order_id IN NUMBER,
+        p_part_id       IN NUMBER,
+        p_quantity      IN NUMBER,
+        p_user_name     IN VARCHAR2
+    ) IS
+        v_status        VARCHAR2(20);
+        v_engineer_id   NUMBER(10,0):=0;
+        v_unit_cost     NUMBER(10,2):=0;
+        v_part_exists   NUMBER;
+        v_existing_id   NUMBER(10,0):=0;
+    BEGIN
+        --   Quantity validation----
+        IF p_quantity IS NULL OR p_quantity <= 0 THEN
+            RAISE_APPLICATION_ERROR(
+                -20100,
+                'Part quantity must be greater than zero.'
+            );
+        END IF;
+        ------Work Order lock + validation------
+          SELECT STATUS,  XH_ASSIGNED_ENGINEER_ID
+          INTO v_status, v_engineer_id
+          FROM XH_WORK_ORDERS
+         WHERE ID = p_work_order_id
+         FOR UPDATE;
+        ------Only IN PROGRESS / ON HOLD can have parts modified------
+        IF v_status NOT IN ('IN PROGRESS', 'ON HOLD') THEN
+            RAISE_APPLICATION_ERROR(
+                -20101,
+                'Parts can only be added when Work Order is IN PROGRESS or ON HOLD.'
+            );
+        END IF;
+        -----Engineer must be assigned------
+        IF v_engineer_id IS NULL THEN
+            RAISE_APPLICATION_ERROR(
+                -20102,
+                'No engineer is assigned to this Work Order.'
+            );
+        END IF;
+        -------Get actual part cost from master table-----
+          SELECT UNIT_COST
+          INTO v_unit_cost
+          FROM XH_PARTS
+          WHERE ID = p_part_id;
+        ------Check  same part already exists-------------
+        BEGIN
+              SELECT ID
+              INTO v_existing_id
+              FROM XH_WORK_ORDER_PARTS
+              WHERE XH_WORK_ORDER_ID = p_work_order_id
+               AND XH_PART_ID = p_part_id
+             FOR UPDATE;
+            --------  
+            --------
+               UPDATE XH_WORK_ORDER_PARTS
+               SET QUANTITY_USED = QUANTITY_USED + p_quantity 
+                   --MODIFIED_BY    = p_user_name,
+                  -- MODIFIED_DATE  = LOCALTIMESTAMP
+             WHERE ID = v_existing_id;
+        EXCEPTION
+            WHEN NO_DATA_FOUND THEN
+                 INSERT INTO XH_WORK_ORDER_PARTS ( XH_WORK_ORDER_ID, XH_PART_ID, QUANTITY_USED,  UNIT_COST, CONSUMED_DATE )
+                 VALUES  ( p_work_order_id, p_part_id,  p_quantity,  v_unit_cost,  SYSDATE );
+        END;
+    EXCEPTION
+        WHEN NO_DATA_FOUND THEN
+            RAISE_APPLICATION_ERROR(
+                -20103,
+                'Work Order or Part not found.'
+            );
+    END XH_ADD_PART_TO_WORK_ORDER;
