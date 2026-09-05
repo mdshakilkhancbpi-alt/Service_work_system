@@ -1,0 +1,98 @@
+SET DEFINE OFF;
+
+CREATE OR REPLACE PROCEDURE XH_ASSIGN_ENGINEER(
+    p_work_order_id      IN NUMBER,
+    p_engineer_id        IN NUMBER,
+    p_scheduled_start    IN DATE,
+    p_scheduled_end      IN DATE,
+    p_user_name          IN VARCHAR2
+) IS
+    v_status          VARCHAR2(20);
+    v_engineer_role   VARCHAR2(20);
+    v_dummy           NUMBER(5) := 0;
+BEGIN
+    -------------- Engineer Role Validation ----------
+    SELECT ROLE
+    INTO v_engineer_role
+    FROM XH_USERS
+    WHERE ID = p_engineer_id
+      AND STATUS = 'Y';
+
+    IF v_engineer_role <> 'ENGINEER' THEN
+        RAISE_APPLICATION_ERROR(
+            -20030,
+            'Selected user is not an active engineer.'
+        );
+    END IF;
+
+    ------------ Validate Order Schedule Date -------- 
+    IF p_scheduled_start IS NULL OR p_scheduled_end IS NULL THEN
+        RAISE_APPLICATION_ERROR(-20031, 'Scheduled start and end time are required.');
+    END IF;
+
+    IF p_scheduled_end <= p_scheduled_start THEN
+        RAISE_APPLICATION_ERROR(-20032, 'Scheduled end time must be later than scheduled start.');
+    END IF;
+
+    ----------- Lock Engineer Row -----------
+    SELECT ID
+    INTO v_dummy
+    FROM XH_USERS
+    WHERE ID = p_engineer_id
+      AND ROLE = 'ENGINEER'
+      AND STATUS = 'Y'
+    FOR UPDATE;
+
+    ----------- Check Overlapping Schedule (Double Booking) -----
+    SELECT COUNT(*)
+    INTO v_dummy
+    FROM XH_WORK_ORDERS
+    WHERE XH_ASSIGNED_ENGINEER_ID = p_engineer_id
+      AND ID <> p_work_order_id
+      AND SCHEDULED_START IS NOT NULL
+      AND SCHEDULED_END IS NOT NULL
+      AND STATUS NOT IN ('CANCELLED', 'CLOSED')
+      AND SCHEDULED_END > p_scheduled_start
+      AND SCHEDULED_START < p_scheduled_end;
+
+    IF v_dummy > 0 THEN
+        RAISE_APPLICATION_ERROR(
+            -20033,
+            'Engineer already has an assignment scheduled during this time period.'
+        );
+    END IF;
+
+    ----------- Lock Work Order Row & Validate Status ----
+    SELECT STATUS
+    INTO v_status
+    FROM XH_WORK_ORDERS
+    WHERE ID = p_work_order_id
+    FOR UPDATE;
+
+    IF v_status <> 'NEW' THEN
+        RAISE_APPLICATION_ERROR(
+            -20034,
+            'Only NEW work orders can be assigned.'
+        );
+    END IF;
+
+    ---------- Assign Work Order to Engineer ----
+    UPDATE XH_WORK_ORDERS
+    SET XH_ASSIGNED_ENGINEER_ID = p_engineer_id,
+        SCHEDULED_START         = p_scheduled_start,
+        SCHEDULED_END           = p_scheduled_end,
+        STATUS                  = 'ASSIGNED',
+        MODIFIED_BY             = p_user_name,
+        MODIFIED_DATE           = LOCALTIMESTAMP
+    WHERE ID = p_work_order_id;
+
+    COMMIT;
+
+EXCEPTION
+    WHEN NO_DATA_FOUND THEN
+        RAISE_APPLICATION_ERROR(
+            -20035,
+            'Work order or engineer was not found.'
+        );
+END XH_ASSIGN_ENGINEER;
+/
