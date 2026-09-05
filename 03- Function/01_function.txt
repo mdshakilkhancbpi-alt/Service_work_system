@@ -1,0 +1,54 @@
+SET DEFINE OFF;
+
+CREATE OR REPLACE FUNCTION XH_LOGIN_AUTHENTICATE (
+    p_username IN VARCHAR2,
+    p_password IN VARCHAR2
+)
+RETURN BOOLEAN
+IS
+    v_user_id       NUMBER;
+    v_last_login    DATE;
+    v_status        VARCHAR2(1);
+BEGIN
+    -- 1. ইউজার আইডি, স্ট্যাটাস এবং শেষ লগইনের তারিখ নির্বাচন করা
+    SELECT ID, NVL(STATUS, 'N'), LAST_LOGIN_DATE
+    INTO v_user_id, v_status, v_last_login
+    FROM XH_USERS
+    WHERE UPPER(USER_NAME) = UPPER(p_username)
+      AND USER_PASSWORD = p_password;
+
+    -- 2. যদি স্ট্যাটাস ইতিমধ্যেই 'N' (Inactive) থাকে, তবে লগইন বাতিল
+    IF v_status = 'N' THEN
+        RETURN FALSE;
+    END IF;
+
+    -- 3. যদি ৩০ দিনের বেশি সময় ধরে লগইন না করে থাকে, তবে অ্যাকাউন্ট নিষ্ক্রিয় করা
+    IF v_last_login IS NOT NULL AND (SYSDATE - v_last_login) >= 30 THEN
+        UPDATE XH_USERS
+        SET STATUS = 'N'
+        WHERE ID = v_user_id;
+        
+        COMMIT;
+        RETURN FALSE;
+    END IF;
+
+    -- 4. সফল লগইনে LAST_LOGIN_DATE আপডেট করা
+    UPDATE XH_USERS
+    SET LAST_LOGIN_DATE = SYSDATE
+    WHERE ID = v_user_id;
+    
+    COMMIT;
+
+    -- 5. APEX সেশন স্টেট সেট করা
+    APEX_UTIL.SET_SESSION_STATE('G_USER_ID', v_user_id);
+
+    RETURN TRUE;
+
+EXCEPTION
+    WHEN NO_DATA_FOUND THEN
+        -- ইউজারনেম বা পাসওয়ার্ড ভুল হলে
+        RETURN FALSE;
+    WHEN OTHERS THEN
+        RETURN FALSE;
+END XH_LOGIN_AUTHENTICATE;
+/
